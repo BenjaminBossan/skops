@@ -1,3 +1,7 @@
+from dataclasses import dataclass
+from typing import Type
+from zipfile import ZipFile
+
 from sklearn.cluster import Birch
 from sklearn.covariance._graph_lasso import _DictWithDeprecatedKeys
 from sklearn.linear_model._sgd_fast import (
@@ -14,7 +18,14 @@ from sklearn.linear_model._sgd_fast import (
 from sklearn.tree._tree import Tree
 from sklearn.utils import Bunch
 
-from ._general import dict_get_instance, dict_get_state, unsupported_get_state
+from ._general import (
+    StateDict,
+    StateTuple,
+    dict_get_instance,
+    dict_get_state,
+    unsupported_get_state,
+)
+from ._types import State
 from ._utils import _get_instance, _get_state, get_module, gettype
 
 ALLOWED_SGD_LOSSES = {
@@ -31,13 +42,35 @@ ALLOWED_SGD_LOSSES = {
 UNSUPPORTED_TYPES = {Birch}
 
 
-def reduce_get_state(obj, dst):
+@dataclass
+class StateObjectReduce(State):
+    content: StateDict
+    args: StateTuple
+
+
+# # same as StateDict
+# @dataclass
+# class StateBunch(State):
+#     key_types: StateList
+#     content: dict[str, State]
+
+
+@dataclass
+class _ContentDictWithDeprecatedKeys:
+    main: StateDict
+    deprecated_key_to_new_key: StateDict
+
+
+@dataclass
+class StateDictWithDeprecatedKeys(State):
+    content: _ContentDictWithDeprecatedKeys
+
+
+def reduce_get_state(obj: LossFunction | Tree, dst: str) -> StateObjectReduce:
     # This method is for objects for which we have to use the __reduce__
     # method to get the state.
-    res = {
-        "__class__": obj.__class__.__name__,
-        "__module__": get_module(type(obj)),
-    }
+    cls = obj.__class__.__name__
+    module = get_module(type(obj))
 
     # We get the output of __reduce__ and use it to reconstruct the object.
     # For security reasons, we don't save the constructor object returned by
@@ -54,8 +87,6 @@ def reduce_get_state(obj, dst):
     #
     # As a good example, this makes Tree object to be serializable.
     reduce = obj.__reduce__()
-    res["__reduce__"] = {}
-    res["__reduce__"]["args"] = _get_state(reduce[1], dst)
 
     if len(reduce) == 3:
         # reduce includes what's needed for __getstate__ and we don't need to
@@ -69,18 +100,24 @@ def reduce_get_state(obj, dst):
         attrs = {}
 
     if not isinstance(attrs, dict):
-        raise TypeError(f"Objects of type {res['__class__']} not supported yet")
+        raise TypeError(f"Objects of type {cls} not supported yet")
 
-    res["content"] = {"attrs": _get_state(attrs, dst)}
-    return res
+    state = StateObjectReduce(
+        cls=cls,
+        module=module,
+        content=_get_state(attrs, dst),
+        args=_get_state(reduce[1], dst),
+    )
+    return state
 
 
-def reduce_get_instance(state, src, constructor):
-    reduce = state["__reduce__"]
-    args = _get_instance(reduce["args"], src)
+def reduce_get_instance(
+    state: StateObjectReduce, src: ZipFile, constructor: Type
+) -> LossFunction | Tree:
+    args = _get_instance(state.args, src)
     instance = constructor(*args)
 
-    attrs = _get_instance(state["content"]["attrs"], src)
+    attrs = _get_instance(state.content, src)
     if not attrs:
         # nothing more to do
         return instance
@@ -96,42 +133,48 @@ def reduce_get_instance(state, src, constructor):
     return instance
 
 
-def Tree_get_instance(state, src):
+def Tree_get_instance(state: StateObjectReduce, src: ZipFile) -> Tree:
     return reduce_get_instance(state, src, constructor=Tree)
 
 
-def sgd_loss_get_instance(state, src):
+def sgd_loss_get_instance(state: StateObjectReduce, src: ZipFile) -> LossFunction:
     cls = gettype(state)
     if cls not in ALLOWED_SGD_LOSSES:
         raise TypeError(f"Expected LossFunction, got {cls}")
     return reduce_get_instance(state, src, constructor=cls)
 
 
-def bunch_get_instance(state, src):
+# TODO
+def bunch_get_instance(state, src: ZipFile) -> Bunch:
     # Bunch is just a wrapper for dict
     content = dict_get_instance(state, src)
     return Bunch(**content)
 
 
-def _DictWithDeprecatedKeys_get_state(obj, dst):
-    res = {
-        "__class__": obj.__class__.__name__,
-        "__module__": get_module(type(obj)),
-    }
-    content = {}
-    content["main"] = dict_get_state(obj, dst)
-    content["_deprecated_key_to_new_key"] = dict_get_state(
-        obj._deprecated_key_to_new_key, dst
+def _DictWithDeprecatedKeys_get_state(
+    obj: _DictWithDeprecatedKeys, dst: str
+) -> StateDictWithDeprecatedKeys:
+    cls = obj.__class__.__name__
+    module = get_module(type(obj))
+    content = _ContentDictWithDeprecatedKeys(
+        main=dict_get_state(obj, dst),
+        deprecated_key_to_new_key=dict_get_state(obj._deprecated_key_to_new_key, dst),
     )
-    res["content"] = content
-    return res
+    state = StateDictWithDeprecatedKeys(
+        cls=cls,
+        module=module,
+        content=content,
+    )
+    return state
 
 
-def _DictWithDeprecatedKeys_get_instance(state, src):
+def _DictWithDeprecatedKeys_get_instance(
+    state: StateDictWithDeprecatedKeys, src: ZipFile
+) -> _DictWithDeprecatedKeys:
     # _DictWithDeprecatedKeys is just a wrapper for dict
-    content = dict_get_instance(state["content"]["main"], src)
+    content = dict_get_instance(state.content.main, src)
     deprecated_key_to_new_key = dict_get_instance(
-        state["content"]["_deprecated_key_to_new_key"], src
+        state.content.deprecated_key_to_new_key, src
     )
     res = _DictWithDeprecatedKeys(**content)
     res._deprecated_key_to_new_key = deprecated_key_to_new_key

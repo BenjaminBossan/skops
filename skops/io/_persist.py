@@ -5,11 +5,13 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Any
 from zipfile import ZipFile
 
 import skops
 
-from ._utils import get_instance, get_state
+from ._types import State
+from ._utils import _get_state, get_instance, get_state
 
 # For now, there is just one protocol version
 PROTOCOL = 0
@@ -30,7 +32,7 @@ for module_name in modules:
 def save(obj, file):
     with tempfile.TemporaryDirectory() as dst:
         with open(Path(dst) / "schema.json", "w") as f:
-            state = get_state(obj, dst)
+            state = _get_state(obj, dst)
             state["protocol"] = PROTOCOL
             state["_skops_version"] = skops.__version__
             json.dump(state, f, indent=2)
@@ -42,8 +44,28 @@ def save(obj, file):
         shutil.move(f"{file}.zip", file)
 
 
+def load_dataclass(state: dict[str, Any]) -> State | dict[str, Any]:
+    if not isinstance(state, dict):  # a 'primitive' type
+        return state
+
+    state = state.copy()
+    dc = state.pop("__dataclass__", None)
+    if not dc:
+        return state
+
+    module_name, _, cls_name = dc.rpartition(".")
+    cls = getattr(importlib.import_module(module_name), cls_name)
+    kwargs = {
+        key: load_dataclass(val)
+        for key, val in state.items()
+        if key != "protocol" and key != "_skops_version"
+    }
+    return cls(**kwargs)
+
+
 def load(file):
     with ZipFile(file, "r") as input_zip:
         schema = input_zip.read("schema.json")
-        instance = get_instance(json.loads(schema), input_zip)
+        state = load_dataclass(json.loads(schema))
+        instance = get_instance(state, input_zip)
     return instance

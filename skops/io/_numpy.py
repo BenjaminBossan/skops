@@ -1,53 +1,110 @@
+from __future__ import annotations
+
 import io
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
+from zipfile import ZipFile
 
 import numpy as np
 
-from ._general import function_get_instance
-from ._persist import get_instance, get_state
-from ._utils import _import_obj, get_module
+from ._general import StateDict, StateTuple, function_get_instance
+from ._types import State
+from ._utils import _get_instance, _get_state, _import_obj, get_module
 
 
-def ndarray_get_state(obj, dst):
-    res = {
-        "__class__": obj.__class__.__name__,
-        "__module__": get_module(type(obj)),
-    }
+@dataclass
+class StateNdarrayDisk(State):
+    file: str
+    content: None
+
+
+@dataclass
+class StateNdarrayJson(State):
+    content: list[State]
+    shape: StateTuple
+
+
+# @dataclass
+# class _ContentMaskedArray:
+#     data: State
+#     mask: State
+
+
+# @dataclass
+# class StateMaskedArray(State):
+#     content: _ContentMaskedArray
+
+
+@dataclass
+class StateRandomState(State):
+    content: StateDict
+
+
+@dataclass
+class StateRandomGenerator(State):
+    content: StateDict
+
+
+@dataclass
+class _ContentUfunc:
+    module_path: str
+    function: str
+
+
+@dataclass
+class StateUfunc(State):
+    content: _ContentUfunc
+
+
+@dataclass
+class StateDtype(State):
+    content: StateNdarrayDisk | StateNdarrayJson
+
+
+def ndarray_get_state(
+    obj: np.ndarray | np.generic, dst: str
+) -> StateNdarrayDisk | StateNdarrayJson:
+    cls = obj.__class__.__name__
+    module = get_module(type(obj))
 
     try:
         f_name = f"{uuid4()}.npy"
         with open(Path(dst) / f_name, "wb") as f:
             np.save(f, obj, allow_pickle=False)
-            res["type"] = "numpy"
-            res["file"] = f_name
+        return StateNdarrayDisk(cls=cls, module=module, file=f_name, content=None)
     except ValueError:
         # Object arrays cannot be saved with allow_pickle=False, therefore we
-        # convert them to a list and recursively call get_state on it.
-        if obj.dtype == object:
-            obj_serialized = get_state(obj.tolist(), dst)
-            res["content"] = obj_serialized["content"]
-            res["type"] = "json"
-            res["shape"] = get_state(obj.shape, dst)
-        else:
+        # convert them to a list and recursively call _get_state on it.
+        if obj.dtype != object:
             raise TypeError(f"numpy arrays of dtype {obj.dtype} are not supported yet")
 
-    return res
+        obj_serialized = _get_state(obj.tolist(), dst)
+        state = StateNdarrayJson(
+            cls=cls,
+            module=module,
+            content=obj_serialized,
+            shape=_get_state(obj.shape, dst),
+        )
+
+    return state
 
 
-def ndarray_get_instance(state, src):
-    if state["type"] == "numpy":
-        val = np.load(io.BytesIO(src.read(state["file"])), allow_pickle=False)
+def ndarray_get_instance(
+    state: StateNdarrayDisk | StateNdarrayJson, src: ZipFile
+) -> np.ndarray | np.generic:
+    if isinstance(state, StateNdarrayDisk):
+        val = np.load(io.BytesIO(src.read(state.file)), allow_pickle=False)
         # Coerce type, because it may not be conserved by np.save/load. E.g. a
         # scalar will be loaded as a 0-dim array.
-        if state["__class__"] != "ndarray":
-            cls = _import_obj(state["__module__"], state["__class__"])
+        if state.cls != "ndarray":
+            cls = _import_obj(state.module, state.cls)
             val = cls(val)
     else:
         # We explicitly set the dtype to "O" since we only save object arrays
         # in json.
-        shape = get_instance(state["shape"], src)
-        tmp = [get_instance(s, src) for s in state["content"]]
+        shape = _get_instance(state.shape, src)
+        tmp = [_get_instance(s, src) for s in state.content]
         # TODO: this is a hack to get the correct shape of the array. We should
         # find a better way to do this.
         if len(shape) == 1:
@@ -59,97 +116,102 @@ def ndarray_get_instance(state, src):
     return val
 
 
-def maskedarray_get_state(obj, dst):
-    res = {
-        "__class__": obj.__class__.__name__,
-        "__module__": get_module(type(obj)),
-        "content": {
-            "data": get_state(obj.data, dst),
-            "mask": get_state(obj.mask, dst),
-        },
-    }
-    return res
+# def maskedarray_get_state(obj: np.ma.MaskedArray, dst: str) -> StateMaskedArray:
+#     state = StateMaskedArray(
+#         cls=obj.__class__.__name__,
+#         module=get_module(type(obj)),
+#         content=_ContentMaskedArray(
+#             data=_get_state(obj.data, dst),
+#             mask=_get_state(obj.mask, dst),
+#         ),
+#     )
+#     return state
 
 
-def maskedarray_get_instance(state, src):
-    data = get_instance(state["content"]["data"], src)
-    mask = get_instance(state["content"]["mask"], src)
-    return np.ma.MaskedArray(data, mask)
+# def maskedarray_get_instance(state: StateMaskedArray, src: ZipFile) -> np.ma.MaskedArray:
+#     data = _get_instance(state.content.data, src)
+#     mask = _get_instance(state.content.mask, src)
+#     return np.ma.MaskedArray(data, mask)
 
 
-def random_state_get_state(obj, dst):
-    content = get_state(obj.get_state(legacy=False), dst)
-    res = {
-        "__class__": obj.__class__.__name__,
-        "__module__": get_module(type(obj)),
-        "type": "numpy",
-        "content": content,
-    }
-    return res
+def random_state_get_state(obj: np.random.RandomState, dst: str) -> StateRandomState:
+    content = _get_state(obj.get_state(legacy=False), dst)
+    state = StateRandomState(
+        cls=obj.__class__.__name__,
+        module=get_module(type(obj)),
+        content=content,
+    )
+    return state
 
 
-def random_state_get_instance(state, src):
-    cls = _import_obj(state["__module__"], state["__class__"])
+def random_state_get_instance(
+    state: StateRandomState, src: ZipFile
+) -> np.random.RandomState:
+    cls = _import_obj(state.module, state.cls)
     random_state = cls()
-    content = get_instance(state["content"], src)
+    content = _get_instance(state.content, src)
     random_state.set_state(content)
     return random_state
 
 
-def random_generator_get_state(obj, dst):
-    bit_generator_state = obj.bit_generator.state
-    res = {
-        "__class__": obj.__class__.__name__,
-        "__module__": get_module(type(obj)),
-        "type": "numpy",
-        "content": {"bit_generator": bit_generator_state},
-    }
-    return res
+def random_generator_get_state(
+    obj: np.random.Generator, dst: str
+) -> StateRandomGenerator:
+    bit_generator_state = _get_state(obj.bit_generator.state, dst)
+    state = StateRandomGenerator(
+        cls=obj.__class__.__name__,
+        module=get_module(type(obj)),
+        content=bit_generator_state,
+    )
+    return state
 
 
-def random_generator_get_instance(state, src):
+def random_generator_get_instance(
+    state: StateRandomGenerator, src: ZipFile
+) -> np.random.Generator:
     # first restore the state of the bit generator
-    bit_generator_state = state["content"]["bit_generator"]
+    bit_generator_state = _get_instance(state.content, src)
     bit_generator = _import_obj("numpy.random", bit_generator_state["bit_generator"])()
     bit_generator.state = bit_generator_state
 
     # next create the generator instance
-    cls = _import_obj(state["__module__"], state["__class__"])
-    random_generator = cls(bit_generator=bit_generator)
+    cls = _import_obj(state.module, state.cls)
+    random_generator = cls(bit_generator=_get_instance(bit_generator, src))
     return random_generator
 
 
 # For numpy.ufunc we need to get the type from the type's module, but for other
-# functions we get it from objet's module directly. Therefore sett a especial
+# functions we get it from objet's module directly. Therefore set a especial
 # get_state method for them here. The load is the same as other functions.
-def ufunc_get_state(obj, dst):
-    res = {
-        "__class__": obj.__class__.__name__,  # ufunc
-        "__module__": get_module(type(obj)),  # numpy
-        "content": {
-            "module_path": get_module(obj),
-            "function": obj.__name__,
-        },
-    }
-    return res
+def ufunc_get_state(obj: np.ufunc, dst: str) -> StateUfunc:
+    state = StateUfunc(
+        # cast to str explicitly because mypy thinks it's a Callable[[ufunc], str]
+        cls=str(obj.__class__.__name__),  # ufunc
+        module=get_module(type(obj)),  # numpy
+        content=_ContentUfunc(
+            module_path=get_module(obj),
+            function=obj.__name__,
+        ),
+    )
+    return state
 
 
-def dtype_get_state(obj, dst):
+def dtype_get_state(obj: np.dtype, dst: str) -> StateDtype:
     # we use numpy's internal save mechanism to store the dtype by
     # saving/loading an empty array with that dtype.
-    tmp = np.ndarray(0, dtype=obj)
-    res = {
-        "__class__": "dtype",
-        "__module__": "numpy",
-        "content": ndarray_get_state(tmp, dst),
-    }
-    return res
+    tmp: np.ndarray = np.ndarray(0, dtype=obj)
+    state = StateDtype(
+        cls="dtype",
+        module="numpy",
+        content=ndarray_get_state(tmp, dst),
+    )
+    return state
 
 
-def dtype_get_instance(state, src):
+def dtype_get_instance(state: StateDtype, src: ZipFile) -> np.dtype:
     # we use numpy's internal save mechanism to store the dtype by
     # saving/loading an empty array with that dtype.
-    tmp = ndarray_get_instance(state["content"], src)
+    tmp = ndarray_get_instance(state.content, src)
     return tmp.dtype
 
 
@@ -157,7 +219,7 @@ def dtype_get_instance(state, src):
 GET_STATE_DISPATCH_FUNCTIONS = [
     (np.generic, ndarray_get_state),
     (np.ndarray, ndarray_get_state),
-    (np.ma.MaskedArray, maskedarray_get_state),
+    # (np.ma.MaskedArray, maskedarray_get_state),
     (np.ufunc, ufunc_get_state),
     (np.dtype, dtype_get_state),
     (np.random.RandomState, random_state_get_state),
@@ -167,7 +229,7 @@ GET_STATE_DISPATCH_FUNCTIONS = [
 GET_INSTANCE_DISPATCH_FUNCTIONS = [
     (np.generic, ndarray_get_instance),
     (np.ndarray, ndarray_get_instance),
-    (np.ma.MaskedArray, maskedarray_get_instance),
+    # (np.ma.MaskedArray, maskedarray_get_instance),
     (np.ufunc, function_get_instance),
     (np.dtype, dtype_get_instance),
     (np.random.RandomState, random_state_get_instance),

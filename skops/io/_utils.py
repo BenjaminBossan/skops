@@ -1,10 +1,14 @@
 import importlib
 import json  # type: ignore
 import sys
+from dataclasses import asdict, is_dataclass
 from functools import _find_impl, get_cache_token, update_wrapper  # type: ignore
 from types import FunctionType
+from typing import Type
 
 from skops.utils.fixes import GenericAlias
+
+from ._types import State
 
 
 # This is an almost 1:1 copy of functools.singledispatch. There is one crucial
@@ -181,14 +185,19 @@ def _import_obj(module, cls_or_func, package=None):
     return getattr(importlib.import_module(module, package=package), cls_or_func)
 
 
-def gettype(state):
-    if "__module__" in state and "__class__" in state:
-        if state["__class__"] == "function":
-            # This special case is due to how functions are serialized. We
-            # could try to change it.
+def gettype(state: State) -> Type:
+    try:
+        if state.cls == "function":
             return FunctionType
-        return _import_obj(state["__module__"], state["__class__"])
-    return None
+        return _import_obj(state.module, state.cls)
+    # if "__module__" in state and "__class__" in state:
+    #     if state["__class__"] == "function":
+    #         # This special case is due to how functions are serialized. We
+    #         # could try to change it.
+    #         return FunctionType
+    #     return _import_obj(state["__module__"], state["__class__"])
+    except AttributeError as exc:
+        raise TypeError(f"Could not determine type of {state.cls}") from exc
 
 
 def get_module(obj):
@@ -225,7 +234,15 @@ def _get_state(value, dst):
     # fails with `get_state`, we try with json.dumps, if that fails, we raise
     # the original error alongside the json error.
     try:
-        return get_state(value, dst)
+        state = get_state(value, dst)
+        if is_dataclass(state):
+            state_dict = asdict(state)
+            state_dict[
+                "__dataclass__"
+            ] = f"{get_module(type(state))}.{type(state).__name__}"
+        else:
+            state_dict = state
+        return state_dict
     except TypeError as e1:
         try:
             return json.dumps(value)
@@ -239,7 +256,7 @@ def _get_instance(value, src):
     if value is None:
         return None
 
-    if gettype(value):
+    if is_dataclass(value):  # or gettype(value):
         return get_instance(value, src)
 
     return json.loads(value)
