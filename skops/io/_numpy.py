@@ -25,15 +25,15 @@ class StateNdarrayJson(State):
     shape: StateTuple
 
 
-# @dataclass
-# class _ContentMaskedArray:
-#     data: State
-#     mask: State
+@dataclass
+class _ContentMaskedArray:
+    data: State
+    mask: State
 
 
-# @dataclass
-# class StateMaskedArray(State):
-#     content: _ContentMaskedArray
+@dataclass
+class StateMaskedArray(State):
+    content: _ContentMaskedArray
 
 
 @dataclass
@@ -116,22 +116,24 @@ def ndarray_get_instance(
     return val
 
 
-# def maskedarray_get_state(obj: np.ma.MaskedArray, dst: str) -> StateMaskedArray:
-#     state = StateMaskedArray(
-#         cls=obj.__class__.__name__,
-#         module=get_module(type(obj)),
-#         content=_ContentMaskedArray(
-#             data=_get_state(obj.data, dst),
-#             mask=_get_state(obj.mask, dst),
-#         ),
-#     )
-#     return state
+def maskedarray_get_state(obj: np.ma.MaskedArray, dst: str) -> StateMaskedArray:
+    state = StateMaskedArray(
+        cls=obj.__class__.__name__,
+        module=get_module(type(obj)),
+        content=_ContentMaskedArray(
+            data=_get_state(obj.data, dst),
+            mask=_get_state(obj.mask, dst),
+        ),
+    )
+    return state
 
 
-# def maskedarray_get_instance(state: StateMaskedArray, src: ZipFile) -> np.ma.MaskedArray:
-#     data = _get_instance(state.content.data, src)
-#     mask = _get_instance(state.content.mask, src)
-#     return np.ma.MaskedArray(data, mask)
+def maskedarray_get_instance(
+    state: StateMaskedArray, src: ZipFile
+) -> np.ma.MaskedArray:
+    data = _get_instance(state.content.data, src)
+    mask = _get_instance(state.content.mask, src)
+    return np.ma.MaskedArray(data, mask)
 
 
 def random_state_get_state(obj: np.random.RandomState, dst: str) -> StateRandomState:
